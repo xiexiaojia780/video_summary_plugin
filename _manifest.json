@@ -21,7 +21,8 @@
   },
   "dependencies": [],
   "capabilities": [
-    "llm.generate"
+    "llm.generate",
+    "api.call"
   ],
   "i18n": {
     "default_locale": "zh-CN",

@@ -310,6 +310,7 @@ async def materialize_video(
     target_dir: Path,
     timeout_s: float,
     max_bytes: int,
+    allow_private: bool = False,
 ) -> Path:
     """把视频落到本地文件。"""
 
@@ -339,6 +340,7 @@ async def materialize_video(
             url=asset.url,
             timeout_s=timeout_s,
             max_bytes=max_bytes,
+            allow_private=allow_private,
         )
         await asyncio.to_thread(out_path.write_bytes, raw)
         return out_path

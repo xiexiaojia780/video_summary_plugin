@@ -93,6 +93,34 @@ def test_http_helpers() -> None:
     assert http_mod.join_api("https://api.example.com/v1/", "chat/completions").endswith(
         "/chat/completions"
     )
+
+    # 公网 OK；内网默认拒绝；loopback 专用通道 OK
+    http_mod.validate_http_url("https://example.com/a.mp4")
+    for bad in (
+        "http://127.0.0.1/x",
+        "http://10.0.0.1/x",
+        "http://192.168.1.1/x",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost/x",
+    ):
+        try:
+            http_mod.validate_http_url(bad)
+            raise AssertionError(f"should block {bad}")
+        except http_mod.HttpClientError:
+            pass
+    http_mod.validate_http_url("http://127.0.0.1:3002", allow_private=True, require_loopback=True)
+    http_mod.validate_http_url("http://localhost:3002", allow_private=True, require_loopback=True)
+    try:
+        http_mod.validate_http_url(
+            "http://192.168.1.8:3002",
+            allow_private=True,
+            require_loopback=True,
+        )
+        raise AssertionError("non-loopback should fail require_loopback")
+    except http_mod.HttpClientError:
+        pass
+    # 显式放行私网
+    http_mod.validate_http_url("http://10.1.2.3/v.mp4", allow_private=True)
     print("OK http helpers")
 
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
+import re
+import socket
 import ssl
 import urllib.error
 import urllib.request
@@ -45,12 +48,155 @@ def join_api(base_url: str, path: str) -> str:
     return urljoin(base, path.lstrip("/"))
 
 
-def validate_http_url(url: str) -> None:
-    """校验 http/https URL。"""
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_BLOCKED_LITERAL_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata",
+    "metadata.google.internal",
+}
+
+
+def _host_from_netloc(netloc: str) -> str:
+    host = (netloc or "").strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        # [IPv6]:port
+        end = host.find("]")
+        if end > 0:
+            return host[1:end].strip().lower()
+        return host.strip("[]").lower()
+    if ":" in host and _IPV4_RE.match(host.split(":", 1)[0]):
+        return host.split(":", 1)[0].strip().lower()
+    # bare hostname or IPv4 without port; IPv6 without brackets is invalid for URL netloc
+    if host.count(":") == 1 and not host.startswith(":"):
+        # hostname:port
+        return host.split(":", 1)[0].strip().lower()
+    return host.strip().lower()
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """是否应拦截的地址（私网/环回/链路本地/元数据等）。"""
+
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        return True
+    if ip.is_multicast or ip.is_unspecified:
+        return True
+    # 部分实现把 CGNAT 100.64/10 标为 is_private；再显式兜底
+    if isinstance(ip, ipaddress.IPv4Address):
+        if ip in ipaddress.ip_network("100.64.0.0/10"):
+            return True
+        if ip in ipaddress.ip_network("169.254.0.0/16"):
+            return True
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip in ipaddress.ip_network("fc00::/7") or ip in ipaddress.ip_network("fe80::/10"):
+            return True
+    return False
+
+
+def is_private_or_local_host(host: str) -> bool:
+    """判断 host 是否像内网/本机/云元数据地址。"""
+
+    hostname = (host or "").strip().lower().rstrip(".")
+    if not hostname:
+        return True
+    if hostname in _BLOCKED_LITERAL_HOSTS:
+        return True
+    if hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return True
+    # 去 IPv6 区号
+    if "%" in hostname:
+        hostname = hostname.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return _is_blocked_ip(ip)
+    except ValueError:
+        pass
+    # 解析 DNS，防止 localhost / 内网域名绕过。
+    # 解析失败不在此处拦截（交给真实请求报错），避免 DNS 抖动把公网域名误杀。
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            return True
+    return False
+
+
+def is_loopback_host(host: str) -> bool:
+    """是否本机环回地址（允许作为 NapCat 专用入口）。"""
+
+    hostname = (host or "").strip().lower().rstrip(".")
+    if not hostname:
+        return False
+    if hostname in {"localhost", "localhost.localdomain"}:
+        return True
+    if hostname.endswith(".localhost"):
+        return True
+    if "%" in hostname:
+        hostname = hostname.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return bool(ip.is_loopback)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            return False
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        if not ip.is_loopback:
+            return False
+    return True
+
+
+def validate_http_url(
+    url: str,
+    *,
+    allow_private: bool = False,
+    require_loopback: bool = False,
+) -> None:
+    """校验 http/https URL，并可拦截内网/本机地址。"""
 
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HttpClientError(f"非法 URL：{url!r}（需要 http/https）")
+    host = _host_from_netloc(parsed.netloc)
+    if not host:
+        raise HttpClientError(f"非法 URL：{url!r}（缺少 host）")
+
+    if require_loopback:
+        if not is_loopback_host(host):
+            raise HttpClientError(
+                f"仅允许本机环回地址（127.0.0.1 / localhost / ::1），拒绝：{host!r}"
+            )
+        return
+
+    if not allow_private and is_private_or_local_host(host):
+        raise HttpClientError(
+            f"拒绝访问内网/本机/元数据地址：{host!r}（如需例外请开启 allow_private_ips）"
+        )
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -65,10 +211,16 @@ def _request_bytes_sync(
     body: bytes | None,
     timeout_s: float,
     max_bytes: int | None = None,
+    allow_private: bool = False,
+    require_loopback: bool = False,
 ) -> tuple[int, bytes, dict[str, str]]:
     """同步请求，返回 status/body/headers。"""
 
-    validate_http_url(url)
+    validate_http_url(
+        url,
+        allow_private=allow_private,
+        require_loopback=require_loopback,
+    )
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
     try:
         with urllib.request.urlopen(
@@ -117,6 +269,8 @@ def _request_json_sync(
     headers: dict[str, str],
     body: dict[str, Any] | None,
     timeout_s: float,
+    allow_private: bool = False,
+    require_loopback: bool = False,
 ) -> dict[str, Any]:
     """同步 JSON 请求。"""
 
@@ -132,6 +286,8 @@ def _request_json_sync(
         headers=req_headers,
         body=data,
         timeout_s=timeout_s,
+        allow_private=allow_private,
+        require_loopback=require_loopback,
     )
     try:
         text = raw.decode("utf-8")
@@ -150,6 +306,8 @@ async def request_json(
     headers: dict[str, str],
     body: dict[str, Any] | None,
     timeout_s: float,
+    allow_private: bool = False,
+    require_loopback: bool = False,
 ) -> dict[str, Any]:
     """异步 JSON 请求。"""
 
@@ -160,6 +318,8 @@ async def request_json(
         headers=headers,
         body=body,
         timeout_s=timeout_s,
+        allow_private=allow_private,
+        require_loopback=require_loopback,
     )
 
 
@@ -169,8 +329,9 @@ async def download_bytes(
     headers: dict[str, str] | None = None,
     timeout_s: float = 60.0,
     max_bytes: int | None = None,
+    allow_private: bool = False,
 ) -> bytes:
-    """下载二进制内容。"""
+    """下载二进制内容（默认拒绝内网/本机地址，防 SSRF）。"""
 
     _status, raw, _headers = await asyncio.to_thread(
         _request_bytes_sync,
@@ -180,6 +341,8 @@ async def download_bytes(
         body=None,
         timeout_s=timeout_s,
         max_bytes=max_bytes,
+        allow_private=allow_private,
+        require_loopback=False,
     )
     return raw
 
@@ -190,6 +353,8 @@ async def post_json(
     body: dict[str, Any] | None,
     headers: dict[str, str] | None = None,
     timeout_s: float = 60.0,
+    allow_private: bool = False,
+    require_loopback: bool = False,
 ) -> dict[str, Any]:
     """POST JSON 并返回对象。"""
 
@@ -199,6 +364,8 @@ async def post_json(
         headers=headers or {"User-Agent": "video-summary-plugin/1.0"},
         body=body,
         timeout_s=timeout_s,
+        allow_private=allow_private,
+        require_loopback=require_loopback,
     )
 
 

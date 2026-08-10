@@ -160,6 +160,15 @@ class SummarySectionConfig(PluginConfigBase):
         description="概括缓存 TTL 秒；0 表示仅进程内不过期直到重启",
         json_schema_extra={"label": "缓存 TTL（秒）", "order": 130},
     )
+    allow_private_ips: bool = Field(
+        default=False,
+        description="是否允许下载消息/外链中的内网或本机 URL（默认关闭，防 SSRF）",
+        json_schema_extra={
+            "label": "允许私网下载 URL",
+            "hint": "仅在可信环境且确需拉取内网视频时开启；默认拒绝 127.0.0.1/10.x/192.168.x 等",
+            "order": 135,
+        },
+    )
     prompt_template: str = Field(
         default=(
             "请根据以下视频关键帧，用中文概括视频内容。"
@@ -231,10 +240,10 @@ class NapcatSectionConfig(PluginConfigBase):
     )
     http_base_url: str = Field(
         default="http://127.0.0.1:3002",
-        description="NapCat OneBot HTTP 地址（只指向本机可信服务；建议为本插件单独开端口）",
+        description="NapCat OneBot HTTP 地址（默认仅允许本机环回；建议为本插件单独开端口）",
         json_schema_extra={
             "label": "HTTP Base URL",
-            "hint": "请使用本插件专用 HTTP Server，例如 http://127.0.0.1:3002（不要复用其它服务端口）",
+            "hint": "仅建议 127.0.0.1 / localhost / ::1，例如 http://127.0.0.1:3002",
             "order": 20,
         },
     )
@@ -247,6 +256,15 @@ class NapcatSectionConfig(PluginConfigBase):
         default=True,
         description="优先走 adapter.napcat.file.get_file（若可用），失败再回退裸 HTTP",
         json_schema_extra={"label": "优先 Adapter API", "order": 40},
+    )
+    allow_non_loopback: bool = Field(
+        default=False,
+        description="是否允许 napcat.http_base_url 指向非本机地址（默认关闭，仅 loopback）",
+        json_schema_extra={
+            "label": "允许非本机 NapCat",
+            "hint": "默认只允许 127.0.0.1/localhost/::1；跨机器部署才开启",
+            "order": 45,
+        },
     )
     allowed_local_prefixes: str = Field(
         default="C:\\Windows\\Temp,/tmp,/var/tmp",
@@ -666,12 +684,14 @@ class VideoSummaryPlugin(MaiBotPlugin):
             ],
         }
         url = http_mod.join_api(endpoint.normalized_base(), "chat/completions")
+        # Direct API 默认也走公网校验；若用户把 base_url 配成内网，需显式 allow_private_ips
         payload = await http_mod.request_json(
             method="POST",
             url=url,
             headers=http_mod.auth_headers(endpoint.api_key),
             body=body,
             timeout_s=float(endpoint.timeout_s),
+            allow_private=bool(self.config.summary.allow_private_ips),
         )
         text = http_mod.extract_chat_text(payload)
         if not text:
@@ -698,6 +718,7 @@ class VideoSummaryPlugin(MaiBotPlugin):
                     target_dir=runtime,
                     timeout_s=float(self.config.summary.download_timeout_s),
                     max_bytes=int(self.config.summary.max_video_bytes),
+                    allow_private=bool(self.config.summary.allow_private_ips),
                 )
             except Exception as exc:  # noqa: BLE001
                 # 文本占位常只剩 hash.mp4 文件名；再尝试 NapCat
@@ -759,6 +780,17 @@ class VideoSummaryPlugin(MaiBotPlugin):
         if not base:
             raise RuntimeError("NapCat http_base_url 为空")
 
+        # 默认强制 loopback，防止把 base_url 配成任意内网探测点
+        require_loopback = not bool(self.config.napcat.allow_non_loopback)
+        try:
+            http_mod.validate_http_url(
+                base if "://" in base else f"http://{base}",
+                allow_private=True,  # loopback 本身属 private；用 require_loopback 约束
+                require_loopback=require_loopback,
+            )
+        except http_mod.HttpClientError as exc:
+            raise RuntimeError(f"非法 napcat.http_base_url：{exc}") from exc
+
         headers = {"User-Agent": "video-summary-plugin/1.0", "Content-Type": "application/json"}
         token = str(self.config.napcat.access_token or "").strip()
         if token:
@@ -769,6 +801,8 @@ class VideoSummaryPlugin(MaiBotPlugin):
             body={"file_id": file_ref, "file": file_ref},
             headers=headers,
             timeout_s=float(self.config.summary.download_timeout_s),
+            allow_private=True,
+            require_loopback=require_loopback,
         )
         data = http_mod.unwrap_onebot_data(payload)
         return await self._bytes_from_napcat_data(data)
@@ -789,10 +823,12 @@ class VideoSummaryPlugin(MaiBotPlugin):
 
         file_url = str(data.get("url") or data.get("file_url") or "").strip()
         if file_url.lower().startswith(("http://", "https://")):
+            # NapCat 常返回本机/内网临时链；允许私网，但仍受超时与大小限制
             return await http_mod.download_bytes(
                 url=file_url,
                 timeout_s=float(self.config.summary.download_timeout_s),
                 max_bytes=max_bytes,
+                allow_private=True,
             )
 
         local_path = str(data.get("file") or data.get("path") or data.get("file_path") or "").strip()

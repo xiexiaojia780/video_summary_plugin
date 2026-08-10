@@ -27,8 +27,10 @@
 | 类型 | 内容 | 说明 |
 |---|---|---|
 | Host 能力 | `llm.generate` | 调用 Host VLM / LLM 生成视频概括（`summary.host_vlm_task`，默认 `vlm`） |
-| 可选网络 | NapCat OneBot HTTP | 仅本机 `napcat.http_base_url`（默认 `127.0.0.1:3002`）上的 `get_file` |
+| Host 能力 | `api.call` | 可选优先调用 `adapter.napcat.file.get_file` 取回视频 |
+| 可选网络 | NapCat OneBot HTTP | 默认**仅本机环回** `napcat.http_base_url`（`127.0.0.1:3002`）上的 `get_file` |
 | 可选网络 | Direct API | 仅 `external_video` 模式；`direct.base_url` + `api_key` 由用户配置 |
+| SSRF 防护 | 消息外链下载 | 默认拒绝内网/本机 URL；可用 `summary.allow_private_ips` 放行 |
 | 系统依赖 | `ffmpeg` | 仅 `frame_vlm`；**不是** Python 包，需本机安装 |
 | 对用户发言 | 默认关闭 | 不主动 `send.text`；只注入 bot 上下文 / 提供 Tool |
 | 本地文件 | 受限 | 仅在 NapCat 返回本地路径时，按 `napcat.allowed_local_prefixes` 白名单读取 |
@@ -153,11 +155,13 @@ video_summary_plugin/
 | `summary` | `max_video_bytes` | 80MB |
 | `summary` | `process_timeout_s` / `max_concurrent` | `180` / `1` |
 | `summary` | `cache_ttl_s` | `3600` |
+| `summary` | `allow_private_ips` | `false`（防 SSRF；默认拒内网下载 URL） |
 | `direct` | `base_url` / `api_key` / `model` | 空（仅 `external_video`） |
 | `napcat` | `enabled` | `true` |
-| `napcat` | `http_base_url` | `http://127.0.0.1:3002` |
+| `napcat` | `http_base_url` | `http://127.0.0.1:3002`（默认仅 loopback） |
 | `napcat` | `access_token` | 空 |
 | `napcat` | `prefer_adapter_api` | `true` |
+| `napcat` | `allow_non_loopback` | `false` |
 | `napcat` | `allowed_local_prefixes` | 临时目录白名单 |
 
 ## 工作流
@@ -197,7 +201,8 @@ python _smoke_test.py
 |---|---|---|
 | 发了视频但完全不处理 | napcat-adapter 只给了文本占位，旧逻辑漏检；或插件未重载 | 确认已是含文本识别的版本；重载插件；看日志有无「检测到 N 个视频素材」 |
 | `video_summary_lookup` 一直「暂无结果」 | 自动处理没启动，或取回/概括失败 | 查插件日志：识别 → NapCat 取回 → 概括完成/失败 |
-| NapCat 取回失败 | `3002` HTTP 未开、端口不对、token 不匹配 | `curl http://127.0.0.1:3002/get_version_info`；核对 `napcat.http_base_url` / `access_token` |
+| NapCat 取回失败 | `3002` HTTP 未开、端口不对、token 不匹配、base_url 非本机 | `curl http://127.0.0.1:3002/get_version_info`；核对 `http_base_url`（默认仅 loopback）/ `access_token` |
+| 外链下载被拒 | 消息里是内网 URL，触发 SSRF 防护 | 默认行为；确需时再开 `summary.allow_private_ips` |
 | `ffmpeg` / 抽帧失败 | 未安装或不在 PATH | `ffmpeg -version`；安装后重启 MaiBot |
 | VLM 返回空 / 概括失败 | Host 未配 `vlm` 任务，或模型不可用 | 在 `model_config` 配置 `vlm`；可先改 `summary.host_vlm_task` |
 | 要不要开 WebSocket？ | — | **不要**为本插件的 `3002` 开 WS；只开 HTTP Server |
