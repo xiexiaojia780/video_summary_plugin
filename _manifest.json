@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "name": "视频内容概括插件",
+  "description": "检测入站视频/视频文件，抽帧走 Host VLM 或直调外部视频多模态 API 生成内容概括，并注入 bot 上下文（不直接对用户发言）",
+  "author": {
+    "name": "xiexiaojia780",
+    "url": "https://github.com/xiexiaojia780"
+  },
+  "license": "GPL-3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/xiexiaojia780/video_summary_plugin"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "llm.generate"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "github.xiexiaojia780.video-summary-plugin"
+}
