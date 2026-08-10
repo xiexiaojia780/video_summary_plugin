@@ -5,14 +5,15 @@
 - **插件 ID**：`github.xiexiaojia780.video-summary-plugin`
 - **版本**：1.0.0
 - **作者**：[xiexiaojia780](https://github.com/xiexiaojia780)
-- **License**：`GPL-3.0-or-later`
+- **License**：`GPL-3.0-or-later`（与 `_manifest.json` / 根目录 `LICENSE` 一致；正文为 GNU GPLv3，允许 any later version）
 - **SDK**：`maibot-plugin-sdk` ≥ 2.0（导入名 `maibot_sdk`）
+- **Host 能力声明**：`llm.generate`（见 `_manifest.json` → `capabilities`）
 
 ## 功能
 
 | 能力 | 说明 |
 |---|---|
-| 自动检测视频 | Hook `chat.receive.after_process`，识别 `file` / `video` / `dict(type=video)` |
+| 自动检测视频 | Hook `chat.receive.after_process`，识别 `file` / `video` / `dict(type=video)` / NapCat 文本占位 |
 | 双模式概括 | `frame_vlm`（默认）：ffmpeg 抽帧 + Host `vlm`；`external_video`：外部视频多模态 API |
 | 上下文注入 | 改写 `processed_plain_text` 为 `[视频内容概括] ...`；可选模型前 system 注入 |
 | 命令 | `/video_summary`、`/视频概括`、`/视频总结`（可附 URL） |
@@ -20,6 +21,31 @@
 | 稳健性 | 大小限制、超时、并发信号量、缓存 TTL、失败写入 `[视频内容概括失败]` |
 
 **默认不 `send.text`**，只让 bot 知道视频内容后自然回复。
+
+## 能力与权限
+
+| 类型 | 内容 | 说明 |
+|---|---|---|
+| Host 能力 | `llm.generate` | 调用 Host VLM / LLM 生成视频概括（`summary.host_vlm_task`，默认 `vlm`） |
+| 可选网络 | NapCat OneBot HTTP | 仅本机 `napcat.http_base_url`（默认 `127.0.0.1:3002`）上的 `get_file` |
+| 可选网络 | Direct API | 仅 `external_video` 模式；`direct.base_url` + `api_key` 由用户配置 |
+| 系统依赖 | `ffmpeg` | 仅 `frame_vlm`；**不是** Python 包，需本机安装 |
+| 对用户发言 | 默认关闭 | 不主动 `send.text`；只注入 bot 上下文 / 提供 Tool |
+| 本地文件 | 受限 | 仅在 NapCat 返回本地路径时，按 `napcat.allowed_local_prefixes` 白名单读取 |
+
+> 本插件**不**申请发送消息能力作为主路径；**不**在代码中硬编码 token / QQ 号 / 群号。  
+> 密钥与私有地址只应写在 WebUI 运行时配置（`config.toml` 由 Runner 生成，已被 `.gitignore`）。
+
+## 安装与启用
+
+1. 将本目录放到 MaiBot 的 `plugins/` 下（目录名建议 `video_summary_plugin`）
+2. 确认已安装 **ffmpeg**（见下文），Host 已配置 **`vlm`** 任务
+3. 若走 QQ / napcat-adapter：在 NapCat **单独新建 HTTP Server**（推荐 `127.0.0.1:3002`）
+4. 在 WebUI 启用本插件，按需填写 `napcat` / `direct` 配置
+5. **重载插件**或重启 MaiBot
+
+> 本插件取文件只走 OneBot **HTTP** `POST /get_file`。  
+> **不要**为 `3002` 再开 WebSocket；现有 MaiBot ↔ napcat-adapter 的收发 WebSocket 保持原样即可。
 
 ## 前置条件
 
@@ -61,11 +87,17 @@ ffmpeg -version
 
 ### NapCat 取回（QQ 视频必需）
 
-当前官方 `napcat-adapter` **不会**把 `video` 段保留为结构化 `file/video`，只转成文本。  
+当前官方 `napcat-adapter` **不会**把 `video` 段保留为结构化 `file/video`，只转成文本，例如：
+
+```text
+[视频] 文件: 185e4ddc6b437969196485b58ce8bd92.mp4，大小: 2897329
+```
+
 因此 QQ 入站视频要自动处理，需要：
 
-1. 在 NapCat **单独新建**一个 HTTP Server（推荐 `127.0.0.1:3002`，不要复用已有服务端口）
-2. 本插件配置：
+1. 在 NapCat **单独新建**一个 **HTTP Server**（推荐 `127.0.0.1:3002`，**不要复用**已有 9998/3000 等端口）
+2. **不必**给这个 `3002` 开 WebSocket（插件不走 WS 取文件）
+3. 本插件配置：
 
 | 字段 | 示例 | 说明 |
 |---|---|---|
@@ -73,12 +105,15 @@ ffmpeg -version
 | `napcat.http_base_url` | `http://127.0.0.1:3002` | 本插件专用 HTTP，与新建 httpServers 端口一致 |
 | `napcat.access_token` | （可空） | 若该 HTTP 配了 token 则填写 |
 | `napcat.prefer_adapter_api` | `true` | 优先 `adapter.napcat.file.get_file`，失败回退裸 HTTP |
+| `napcat.allowed_local_prefixes` | `C:\Windows\Temp,/tmp,/var/tmp` | `get_file` 返回本地路径时的白名单 |
 
 验证 HTTP：
 
 ```bash
 curl http://127.0.0.1:3002/get_version_info
 ```
+
+返回含 `"status":"ok"` 即可。然后重载本插件，再发视频。
 
 ### 模式 B：`external_video`
 
@@ -104,7 +139,7 @@ video_summary_plugin/
 
 ## 配置要点
 
-配置全部由 `config_model` 声明（**不要手写 config.toml**）：
+配置全部由 `config_model` 声明（**优先在 WebUI 改**；不要长期手写 `config.toml`）：
 
 | 分组 | 关键字段 | 默认 |
 |---|---|---|
@@ -118,7 +153,12 @@ video_summary_plugin/
 | `summary` | `max_video_bytes` | 80MB |
 | `summary` | `process_timeout_s` / `max_concurrent` | `180` / `1` |
 | `summary` | `cache_ttl_s` | `3600` |
-| `direct` | `base_url` / `api_key` / `model` | 空（仅 external） |
+| `direct` | `base_url` / `api_key` / `model` | 空（仅 `external_video`） |
+| `napcat` | `enabled` | `true` |
+| `napcat` | `http_base_url` | `http://127.0.0.1:3002` |
+| `napcat` | `access_token` | 空 |
+| `napcat` | `prefer_adapter_api` | `true` |
+| `napcat` | `allowed_local_prefixes` | 临时目录白名单 |
 
 ## 工作流
 
@@ -151,9 +191,33 @@ video_summary_plugin/
 python _smoke_test.py
 ```
 
+## 常见问题
+
+| 现象 | 可能原因 | 处理 |
+|---|---|---|
+| 发了视频但完全不处理 | napcat-adapter 只给了文本占位，旧逻辑漏检；或插件未重载 | 确认已是含文本识别的版本；重载插件；看日志有无「检测到 N 个视频素材」 |
+| `video_summary_lookup` 一直「暂无结果」 | 自动处理没启动，或取回/概括失败 | 查插件日志：识别 → NapCat 取回 → 概括完成/失败 |
+| NapCat 取回失败 | `3002` HTTP 未开、端口不对、token 不匹配 | `curl http://127.0.0.1:3002/get_version_info`；核对 `napcat.http_base_url` / `access_token` |
+| `ffmpeg` / 抽帧失败 | 未安装或不在 PATH | `ffmpeg -version`；安装后重启 MaiBot |
+| VLM 返回空 / 概括失败 | Host 未配 `vlm` 任务，或模型不可用 | 在 `model_config` 配置 `vlm`；可先改 `summary.host_vlm_task` |
+| 要不要开 WebSocket？ | — | **不要**为本插件的 `3002` 开 WS；只开 HTTP Server |
+| 命令发了没回用户 | 设计如此 | 命令只注入上下文，不 `send.text` 抢答 |
+
 ## 限制与说明
 
-- MaiBot 当前**没有一等公民 VideoComponent**；本插件兼容 `file` / 透传 `dict` / 显式 `video` 段。
+- MaiBot 当前**没有一等公民 VideoComponent**；本插件兼容 `file` / 透传 `dict` / 显式 `video` 段，以及 NapCat 文本占位。
 - Host `llm.generate` 无原生 video 入参；`frame_vlm` 必须抽帧。
 - 大视频受 `max_video_bytes` 限制；data URL 外发可能很重，优先使用公网 URL。
 - 异步概括与回复竞速时，依赖「处理中占位 + 模型前注入 + Tool」三重兜底。
+- 本插件**不会**修改 MaiBot 主程序；QQ 侧依赖独立 HTTP `get_file`，与收发消息用的 WebSocket 无关。
+- Python 依赖：仅标准库 + Host 自带 `maibot_sdk`；`_manifest.json` 的 `dependencies` 为空是预期行为。系统依赖 `ffmpeg` 见上文。
+
+## 许可证
+
+本项目以 **GPL-3.0-or-later** 授权：
+
+- SPDX / `_manifest.json`：`GPL-3.0-or-later`
+- 根目录 `LICENSE`：GNU General Public License **Version 3** 正文  
+- 含义：你可按 GPLv3，或（若适用）任何更新版本的 GPL 使用/分发
+
+完整条款见 [`LICENSE`](./LICENSE)。
