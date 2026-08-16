@@ -13,6 +13,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from urllib.response import addinfourl
 
 
 class HttpClientError(Exception):
@@ -199,8 +200,50 @@ def validate_http_url(
         )
 
 
+_MAX_REDIRECTS = 5
+
+
 def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """跟随重定向前再次校验目标 URL，避免公网 302 打到内网。"""
+
+    def __init__(self, *, allow_private: bool, require_loopback: bool, max_redirects: int) -> None:
+        super().__init__()
+        self._allow_private = allow_private
+        self._require_loopback = require_loopback
+        self._max_redirects = max_redirects
+        self._hops = 0
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: addinfourl,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        self._hops += 1
+        if self._hops > self._max_redirects:
+            raise HttpClientError(f"重定向次数超过限制（{self._max_redirects}）")
+        validate_http_url(
+            newurl,
+            allow_private=self._allow_private,
+            require_loopback=self._require_loopback,
+        )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _build_opener(*, allow_private: bool, require_loopback: bool) -> urllib.request.OpenerDirector:
+    redirect = _ValidatingRedirectHandler(
+        allow_private=allow_private,
+        require_loopback=require_loopback,
+        max_redirects=_MAX_REDIRECTS,
+    )
+    return urllib.request.build_opener(redirect)
 
 
 def _request_bytes_sync(
@@ -222,11 +265,11 @@ def _request_bytes_sync(
         require_loopback=require_loopback,
     )
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
+    opener = _build_opener(allow_private=allow_private, require_loopback=require_loopback)
     try:
-        with urllib.request.urlopen(
+        with opener.open(
             request,
             timeout=max(1.0, float(timeout_s)),
-            context=_ssl_context() if url.lower().startswith("https") else None,
         ) as resp:
             status = int(getattr(resp, "status", None) or resp.getcode() or 0)
             resp_headers = {str(k).lower(): str(v) for k, v in dict(resp.headers).items()}
@@ -244,6 +287,8 @@ def _request_bytes_sync(
                         raise HttpClientError(f"响应体超过大小限制（{max_bytes} bytes）")
                     chunks.append(chunk)
                 raw = b"".join(chunks)
+    except HttpClientError:
+        raise
     except urllib.error.HTTPError as exc:
         err_body = ""
         try:
@@ -251,10 +296,13 @@ def _request_bytes_sync(
         except Exception:  # noqa: BLE001
             pass
         raise HttpClientError(f"HTTP {exc.code}：{err_body or exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        raise HttpClientError(f"网络错误：{exc.reason}") from exc
-    except TimeoutError as exc:
-        raise HttpClientError(f"请求超时（{timeout_s}s）") from exc
+    except urllib.error.URLError as extra:
+        reason = getattr(extra, "reason", extra)
+        if isinstance(reason, HttpClientError):
+            raise reason from extra
+        raise HttpClientError(f"网络错误：{reason}") from extra
+    except TimeoutError as extra:
+        raise HttpClientError(f"请求超时（{timeout_s}s）") from extra
 
     if status >= 400:
         text = raw.decode("utf-8", errors="replace")[:500]

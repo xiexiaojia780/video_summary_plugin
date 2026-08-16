@@ -17,8 +17,8 @@
 | 双模式概括 | `frame_vlm`（默认）：ffmpeg 抽帧 + Host `vlm`；`external_video`：外部视频多模态 API |
 | 上下文注入 | 改写 `processed_plain_text` 为 `[视频内容概括] ...`；可选模型前 system 注入 |
 | 命令 | `/video_summary`、`/视频概括`、`/视频总结`（可附 URL） |
-| Tool | `video_summary_lookup`：供模型查询最近概括 |
-| 稳健性 | 大小限制、超时、并发信号量、缓存 TTL、失败写入 `[视频内容概括失败]` |
+| Tool | `video_summary_lookup`：查最近概括；`video_summary_ingest`：对指定 URL 立即概括 |
+| 稳健性 | 大小限制、超时、并发信号量、**单次处理上限（单条消息最多 N 个视频）**、缓存 TTL、失败写入 `[视频内容概括失败]` |
 
 **默认不 `send.text`**，只让 bot 知道视频内容后自然回复。
 
@@ -30,7 +30,7 @@
 | Host 能力 | `api.call` | 可选优先调用 `adapter.napcat.file.get_file` 取回视频 |
 | 可选网络 | NapCat OneBot HTTP | 默认**仅本机环回** `napcat.http_base_url`（`127.0.0.1:3002`）上的 `get_file` |
 | 可选网络 | Direct API | 仅 `external_video` 模式；`direct.base_url` + `api_key` 由用户配置 |
-| SSRF 防护 | 消息外链下载 | 默认拒绝内网/本机 URL；可用 `summary.allow_private_ips` 放行 |
+| SSRF 防护 | 消息外链下载 | 默认拒绝内网/本机 URL；HTTP 重定向目标会再次校验；可用 `summary.allow_private_ips` 放行 |
 | 系统依赖 | `ffmpeg` | 仅 `frame_vlm`；**不是** Python 包，需本机安装 |
 | 对用户发言 | 默认关闭 | 不主动 `send.text`；只注入 bot 上下文 / 提供 Tool |
 | 本地文件 | 受限 | 仅在 NapCat 返回本地路径时，按 `napcat.allowed_local_prefixes` 白名单读取 |
@@ -154,6 +154,7 @@ video_summary_plugin/
 | `summary` | `max_frames` / `frame_interval_s` | `6` / `2.0` |
 | `summary` | `max_video_bytes` | 80MB |
 | `summary` | `process_timeout_s` / `max_concurrent` | `180` / `1` |
+| `summary` | `max_videos_per_message` | `3`（单次处理上限：一条消息最多处理的视频数） |
 | `summary` | `cache_ttl_s` | `3600` |
 | `summary` | `allow_private_ips` | `false`（防 SSRF；默认拒内网下载 URL） |
 | `direct` | `base_url` / `api_key` / `model` | 空（仅 `external_video`） |
@@ -188,6 +189,15 @@ video_summary_plugin/
 ```
 
 命令默认**不抢答用户**（返回空文本并继续主链），只确保概括进入 bot 可见上下文。
+
+## 供 LLM 的 Tool
+
+| Tool | 作用 |
+|---|---|
+| `video_summary_lookup` | 查询当前会话最近一次视频概括（缓存） |
+| `video_summary_ingest` | 对指定的 http(s) 视频直链**立即**生成概括并返回文本 |
+
+模型在用户贴出视频链接、或视频未被自动处理时，可调用 `video_summary_ingest(url=..., stream_id=...)`。
 
 ## 离线自检
 

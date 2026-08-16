@@ -153,6 +153,17 @@ class SummarySectionConfig(PluginConfigBase):
         description="同时处理的视频任务数",
         json_schema_extra={"label": "最大并发", "order": 120},
     )
+    max_videos_per_message: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="单条消息最多处理的视频数；超出部分跳过（避免一次太多视频）",
+        json_schema_extra={
+            "label": "单条消息视频上限",
+            "hint": "同一消息里视频过多时只处理前 N 个",
+            "order": 125,
+        },
+    )
     cache_ttl_s: float = Field(
         default=3600.0,
         ge=0.0,
@@ -374,6 +385,18 @@ class VideoSummaryPlugin(MaiBotPlugin):
             return None
 
         stream_id = self._extract_stream_id(message)
+        limit = max(1, int(self.config.summary.max_videos_per_message))
+        total = len(assets)
+        if total > limit:
+            self.ctx.logger.info(
+                "单条消息视频数 %s 超过上限 %s，仅处理前 %s 个 session=%s",
+                total,
+                limit,
+                limit,
+                stream_id or "-",
+            )
+            assets = assets[:limit]
+
         self.ctx.logger.info(
             "检测到 %s 个视频素材，启动概括 session=%s names=%s",
             len(assets),
@@ -501,6 +524,58 @@ class VideoSummaryPlugin(MaiBotPlugin):
             record = max(self._session_latest.values(), key=lambda item: float(item.get("ts") or 0.0))
         if not record:
             return {"content": "暂无视频概括结果。请等待自动处理完成，或让用户重新发送视频。"}
+        return {"content": self._format_summary_block(record)}
+
+    @Tool(
+        "video_summary_ingest",
+        brief_description="对指定视频 URL 立即生成内容概括",
+        detailed_description=(
+            "当需要手动对某个视频（公网 http(s) 视频直链）生成概括时调用，"
+            "例如用户在对话中贴出视频链接、或需要重试某个视频。"
+            "参数：\n"
+            "- url：string，必填，视频直链（http/https）。\n"
+            "- stream_id：string，可选，当前聊天流 ID（用于缓存归属）。\n"
+            "返回生成的概括文本；失败时返回错误原因。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="url",
+                param_type=ToolParamType.STRING,
+                description="视频直链（http/https）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="stream_id",
+                param_type=ToolParamType.STRING,
+                description="当前聊天流 ID",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_video_summary_ingest(self, url: str = "", stream_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        """供模型手动对指定 URL 生成视频概括（同步等待结果）。"""
+
+        del kwargs
+        if not self.config.plugin.enabled:
+            return {"content": "视频概括插件未启用"}
+
+        raw_url = str(url or "").strip()
+        if not raw_url.lower().startswith(("http://", "https://")):
+            return {"content": "参数 url 需要是 http(s) 视频直链"}
+
+        asset = media_mod.VideoAsset(
+            source_kind="tool",
+            url=raw_url,
+            name=Path(raw_url).name or "video",
+        )
+        # 直接等待结果（走与自动流程相同的缓存/inflight/概括逻辑）
+        try:
+            record = await self._process_and_store(asset, stream_id=stream_id or "", message=None)
+        except Exception as exc:  # noqa: BLE001
+            return {"content": f"视频概括失败：{exc}"}
+
+        if not record.get("success"):
+            return {"content": f"视频概括失败：{record.get('error') or '未知错误'}"}
         return {"content": self._format_summary_block(record)}
 
     # ------------------------------------------------------------------

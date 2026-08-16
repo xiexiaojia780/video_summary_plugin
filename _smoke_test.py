@@ -121,6 +121,26 @@ def test_http_helpers() -> None:
         pass
     # 显式放行私网
     http_mod.validate_http_url("http://10.1.2.3/v.mp4", allow_private=True)
+
+    # 重定向到内网必须被二次校验拦住
+    handler = http_mod._ValidatingRedirectHandler(
+        allow_private=False,
+        require_loopback=False,
+        max_redirects=5,
+    )
+    fake_req = type("Req", (), {})()
+    try:
+        handler.redirect_request(
+            fake_req,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            302,
+            "Found",
+            {},
+            "http://127.0.0.1/secret",
+        )
+        raise AssertionError("redirect to loopback should be blocked")
+    except http_mod.HttpClientError:
+        pass
     print("OK http helpers")
 
 
