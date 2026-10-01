@@ -17,13 +17,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Literal
+
 import asyncio
 import hashlib
 import re
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Literal
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
@@ -222,7 +223,7 @@ class SummarySectionConfig(PluginConfigBase):
 class DirectApiSectionConfig(PluginConfigBase):
     """外部视频多模态 API 配置。"""
 
-    __ui_label__ = "Direct API"
+    __ui_label__ = "外部 API"
     __ui_icon__ = "globe"
     __ui_order__ = 2
 
@@ -230,7 +231,7 @@ class DirectApiSectionConfig(PluginConfigBase):
         default="",
         description="OpenAI 兼容根地址，如 https://api.example.com/v1",
         json_schema_extra={
-            "label": "Base URL",
+            "label": "接口地址（Base URL）",
             "x-widget": "textarea",
             "rows": 1,
             "order": 10,
@@ -238,8 +239,8 @@ class DirectApiSectionConfig(PluginConfigBase):
     )
     api_key: str = Field(
         default="",
-        description="API Key（Bearer）",
-        json_schema_extra={"label": "API Key", "order": 20},
+        description="接口密钥，以 Bearer 头发送",
+        json_schema_extra={"label": "接口密钥（API Key）", "order": 20},
     )
     model: str = Field(
         default="",
@@ -263,7 +264,7 @@ class DirectApiSectionConfig(PluginConfigBase):
 class NapcatSectionConfig(PluginConfigBase):
     """NapCat OneBot HTTP：用于把文本占位里的 file/file_id 取回真实视频。"""
 
-    __ui_label__ = "NapCat"
+    __ui_label__ = "NapCat 取回"
     __ui_icon__ = "plug"
     __ui_order__ = 3
 
@@ -276,7 +277,7 @@ class NapcatSectionConfig(PluginConfigBase):
         default="http://127.0.0.1:3002",
         description="NapCat OneBot HTTP 地址（默认仅允许本机环回；建议为本插件单独开端口）",
         json_schema_extra={
-            "label": "HTTP Base URL",
+            "label": "HTTP 地址（Base URL）",
             "hint": "仅建议 127.0.0.1 / localhost / ::1，例如 http://127.0.0.1:3002",
             "order": 20,
         },
@@ -284,7 +285,7 @@ class NapcatSectionConfig(PluginConfigBase):
     access_token: str = Field(
         default="",
         description="NapCat HTTP access token；未设置则留空",
-        json_schema_extra={"label": "Access Token", "order": 30},
+        json_schema_extra={"label": "访问令牌（Access Token）", "order": 30},
     )
     prefer_adapter_api: bool = Field(
         default=True,
@@ -351,14 +352,18 @@ class VideoSummaryPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
-        """插件卸载：取消后台任务并清理临时目录。"""
+        """插件卸载：取消后台任务、等待其结束，并清理临时目录。"""
 
-        for task in list(self._bg_tasks):
+        # bg 任务与 inflight 任务都要取消：await 一个 Task 时取消外层协程并不会连带取消
+        # 被等待的 Task，所以两者都得管。取消后必须再 gather 等它们真正结束，
+        # 否则 on_unload() 返回时任务还在跑，热重载/退出会留下悬挂回调。
+        pending: list[asyncio.Task[Any]] = [*self._bg_tasks, *self._inflight.values()]
+        for task in pending:
             task.cancel()
         self._bg_tasks.clear()
-        for task in list(self._inflight.values()):
-            task.cancel()
         self._inflight.clear()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         try:
             await self._cleanup_runtime_dir()
         except Exception as exc:  # noqa: BLE001
@@ -980,11 +985,19 @@ class VideoSummaryPlugin(MaiBotPlugin):
         # 默认强制 loopback，防止把 base_url 配成任意内网探测点
         require_loopback = not bool(self.config.napcat.allow_non_loopback)
         try:
-            http_mod.validate_http_url(
-                base if "://" in base else f"http://{base}",
-                allow_private=True,  # loopback 本身属 private；用 require_loopback 约束
-                require_loopback=require_loopback,
+            # validate_http_url 内部要走 socket.getaddrinfo 做 DNS 解析：既阻塞又没有超时参数，
+            # 直接在协程里调用会卡住 Runner 的事件循环，所以放进线程并加一道超时。
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    http_mod.validate_http_url,
+                    base if "://" in base else f"http://{base}",
+                    allow_private=True,  # loopback 本身属 private；用 require_loopback 约束
+                    require_loopback=require_loopback,
+                ),
+                timeout=float(self.config.summary.download_timeout_s),
             )
+        except TimeoutError as exc:
+            raise RuntimeError(f"校验 napcat.http_base_url 超时（DNS 未返回）：{base}") from exc
         except http_mod.HttpClientError as exc:
             raise RuntimeError(f"非法 napcat.http_base_url：{exc}") from exc
 

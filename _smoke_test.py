@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import asyncio
 import base64
 import importlib
@@ -9,8 +12,6 @@ import os
 import sys
 import tempfile
 import time
-from pathlib import Path
-from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -77,7 +78,7 @@ def test_video_recognition() -> None:
                 "data": "[视频] 文件: 185e4ddc6b437969196485b58ce8bd92.mp4，大小: 2897329",
             }
         ],
-        "session_id": "qq_private_483403354",
+        "session_id": "qq_private_100000000",
     }
     napcat_assets = media_mod.extract_video_assets(napcat_msg)
     assert len(napcat_assets) == 1, napcat_assets
@@ -592,6 +593,57 @@ def test_format_and_cache() -> None:
     print("OK format/cache helpers")
 
 
+def test_network_guard_and_cleanup() -> None:
+    """校验 NapCat URL 校验不阻塞事件循环，以及 on_unload 能真正收尾后台任务。"""
+
+    async def _run() -> None:
+        plugin = plugin_mod.create_plugin()
+
+        async def rpc(*_a, **_k):  # noqa: ANN001
+            return {}
+
+        plugin._set_context(
+            PluginContext(
+                plugin_id="github.xiexiaojia780.video-summary-plugin",
+                rpc_call=rpc,
+                paths=PluginPaths(
+                    data_dir=Path("data/plugins/video_summary_smoke"),
+                    runtime_dir=Path("temp/plugins/video_summary_smoke"),
+                ),
+            )
+        )
+        plugin.set_plugin_config(plugin.get_default_config())
+
+        # 非 loopback 的 NapCat 地址必须被拒（该校验内部是阻塞 DNS，已挪进线程并加了超时）
+        plugin.config.napcat.http_base_url = "http://192.168.1.9:3002"
+        try:
+            await plugin._fetch_via_napcat_http("a.mp4")
+            raise AssertionError("非 loopback 的 NapCat 地址应当被拒绝")
+        except RuntimeError as exc:
+            assert "非法" in str(exc), exc
+
+        # 自己配的 loopback 地址应通过校验，只会在真正连接时失败（确认没有误杀）
+        plugin.config.napcat.http_base_url = "http://127.0.0.1:59999"
+        try:
+            await plugin._fetch_via_napcat_http("a.mp4")
+            raise AssertionError("不该真的连上")
+        except Exception as exc:  # noqa: BLE001
+            assert "非法" not in str(exc), exc
+
+        # on_unload 必须取消**并等待**后台任务结束，而不是只发个 cancel 就返回
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(30)
+
+        task = asyncio.create_task(_sleep_forever())
+        plugin._bg_tasks.add(task)
+        await asyncio.sleep(0)
+        await plugin.on_unload()
+        assert task.cancelled(), "on_unload 返回后后台任务仍未被取消"
+
+    asyncio.run(_run())
+    print("OK network guard + unload cleanup")
+
+
 def main() -> None:
     test_video_recognition()
     test_http_helpers()
@@ -599,6 +651,7 @@ def main() -> None:
     test_components_and_hooks()
     test_injection_flow()
     test_format_and_cache()
+    test_network_guard_and_cleanup()
     print("ALL PASSED")
 
 

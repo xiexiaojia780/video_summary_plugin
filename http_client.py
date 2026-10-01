@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urljoin, urlparse
+from urllib.response import addinfourl
+
 import asyncio
 import ipaddress
 import json
@@ -10,10 +15,6 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urljoin, urlparse
-from urllib.response import addinfourl
 
 
 class HttpClientError(Exception):
