@@ -136,9 +136,10 @@ video_summary_plugin/
 ├── plugin.py          # 配置 / Hook / Command / Tool / 双模式调度
 ├── media.py           # 视频识别、下载落盘、ffmpeg 抽帧
 ├── http_client.py     # 下载与外部 API（stdlib）
-├── _smoke_test.py
+├── _smoke_test.py     # 离线自检：装载宿主真码校验注入协议与 Tool 契约
 ├── README.md
-└── _locales/
+├── LICENSE            # GNU GPLv3 正文
+└── _locales/          # i18n 占位（当前 zh-CN 为空对象）
 ```
 
 ## 配置要点
@@ -155,18 +156,22 @@ video_summary_plugin/
 | `summary` | `inject_on_model_request` | `false`（可选通道：插到 prompt 前缀，会降低缓存命中） |
 | `summary` | `host_vlm_task` | `vlm` |
 | `summary` | `max_frames` / `frame_interval_s` | `6` / `2.0` |
-| `summary` | `max_video_bytes` | 80MB |
+| `summary` | `max_video_bytes` | `83886080`（80 MB） |
+| `summary` | `download_timeout_s` | `60.0` |
 | `summary` | `process_timeout_s` / `max_concurrent` | `180` / `1` |
 | `summary` | `max_videos_per_message` | `3`（单次处理上限：一条消息最多处理的视频数） |
 | `summary` | `cache_ttl_s` | `3600` |
 | `summary` | `allow_private_ips` | `false`（防 SSRF；默认拒内网下载 URL） |
+| `summary` | `prompt_template` | 中文概括提示词（默认要求 120~250 字，在 WebUI 编辑） |
 | `direct` | `base_url` / `api_key` / `model` | 空（仅 `external_video`） |
+| `direct` | `timeout_s` | `120.0` |
+| `direct` | `prefer_url` | `true`（素材有 http(s) URL 时优先直接传给外部模型） |
 | `napcat` | `enabled` | `true` |
 | `napcat` | `http_base_url` | `http://127.0.0.1:3002`（默认仅 loopback） |
 | `napcat` | `access_token` | 空 |
 | `napcat` | `prefer_adapter_api` | `true` |
 | `napcat` | `allow_non_loopback` | `false` |
-| `napcat` | `allowed_local_prefixes` | 临时目录白名单 |
+| `napcat` | `allowed_local_prefixes` | `C:\Windows\Temp,/tmp,/var/tmp` |
 
 > 调用 Host VLM 时插件一律传 `model=<host_vlm_task>`，**不传 `task_name`**。这是为了同时兼容 1.2.4 与 1.2.5：
 >
