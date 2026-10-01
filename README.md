@@ -138,6 +138,7 @@ video_summary_plugin/
 ├── http_client.py     # 下载与外部 API（stdlib）
 ├── _smoke_test.py     # 离线自检：装载宿主真码校验注入协议与 Tool 契约
 ├── README.md
+├── CHANGELOG.md       # 版本变更记录（_manifest.json 的 changelog 字段指向它）
 ├── LICENSE            # GNU GPLv3 正文
 └── _locales/          # i18n 占位（当前 zh-CN 为空对象）
 ```

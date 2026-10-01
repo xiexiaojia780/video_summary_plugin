@@ -11,6 +11,7 @@
   "urls": {
     "repository": "https://github.com/xiexiaojia780/video_summary_plugin"
   },
+  "changelog": "CHANGELOG.md",
   "host_application": {
     "min_version": "1.0.0",
     "max_version": "1.99.99"
