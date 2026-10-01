@@ -4,15 +4,24 @@
 - frame_vlm：ffmpeg 抽帧 + Host VLM（ctx.llm.generate model=vlm）
 - external_video：直调外部视频多模态 API
 
-默认把概括注入 bot 可见上下文（改写 processed_plain_text / 模型前注入），
-不直接对用户 send.text。
+概括结果默认通过 **聊天历史注入**（``ctx.maisaka.context.append``）追加为一条真实上下文消息，
+不直接对用户 ``send.text``。可选开启 **模型请求前注入**（``maisaka.replyer.before_model_request``），
+但该方式会改写 prompt 前缀、牺牲 prompt 缓存命中率，故默认关闭。
+
+两种注入通道的差别（宿主 prompt 缓存按「最长公共前缀」计算，见
+``src/services/llm_cache_stats.py:230``）：
+
+- 聊天历史注入：追加在历史末尾，是 append-only，已有前缀不变 → 缓存命中不受影响；
+- 模型请求前注入：插在 system 之后、历史之前，插入点之后的全部 token 缓存失效 → 明显降低命中率。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,7 +58,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件"},
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.1.0",
         description="配置版本",
         json_schema_extra={"label": "配置版本"},
     )
@@ -86,10 +95,24 @@ class SummarySectionConfig(PluginConfigBase):
         description="是否向 LLM 暴露 video_summary_lookup 工具",
         json_schema_extra={"label": "启用 Tool", "order": 40},
     )
-    inject_on_model_request: bool = Field(
+    inject_chat_history: bool = Field(
         default=True,
-        description="在模型请求前按 session 注入最近视频概括（兜底）",
-        json_schema_extra={"label": "模型请求前注入", "order": 50},
+        description="概括完成后，把结果作为一条上下文消息追加进 Maisaka 聊天历史",
+        json_schema_extra={
+            "label": "追加到聊天历史",
+            "hint": "推荐通道：追加在历史末尾，后续回合都能看到，且不破坏 prompt 前缀缓存",
+            "order": 50,
+        },
+    )
+    inject_on_model_request: bool = Field(
+        default=False,
+        description="在模型请求前把概括注入为一条 System Item（会改写 prompt 前缀）",
+        json_schema_extra={
+            "label": "模型请求前注入",
+            "hint": "默认关闭：它插在历史之前，会使插入点之后的全部 token 缓存失效、明显降低命中率；"
+            "仅在无法使用聊天历史注入时开启",
+            "order": 55,
+        },
     )
     host_vlm_task: str = Field(
         default="vlm",
@@ -310,6 +333,8 @@ class VideoSummaryPlugin(MaiBotPlugin):
         self._session_latest: dict[str, dict[str, Any]] = {}
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        # 已追加进聊天历史的 (session, cache_key)，避免同一概括重复入库
+        self._published: set[str] = set()
 
     async def on_load(self) -> None:
         """插件加载。"""
@@ -318,9 +343,11 @@ class VideoSummaryPlugin(MaiBotPlugin):
         runtime = Path(self.ctx.paths.runtime_dir)
         runtime.mkdir(parents=True, exist_ok=True)
         self.ctx.logger.info(
-            "视频内容概括插件已加载 mode=%s auto=%s",
+            "视频内容概括插件已加载 mode=%s auto=%s 聊天历史注入=%s 模型前注入=%s",
             self.config.summary.mode,
             self.config.summary.auto_process,
+            self.config.summary.inject_chat_history,
+            self.config.summary.inject_on_model_request,
         )
 
     async def on_unload(self) -> None:
@@ -343,9 +370,11 @@ class VideoSummaryPlugin(MaiBotPlugin):
         del scope, config_data, version
         self._semaphore = asyncio.Semaphore(max(1, int(self.config.summary.max_concurrent)))
         self.ctx.logger.info(
-            "视频内容概括插件配置已更新 mode=%s auto=%s",
+            "视频内容概括插件配置已更新 mode=%s auto=%s 聊天历史注入=%s 模型前注入=%s",
             self.config.summary.mode,
             self.config.summary.auto_process,
+            self.config.summary.inject_chat_history,
+            self.config.summary.inject_on_model_request,
         )
 
     # ------------------------------------------------------------------
@@ -355,7 +384,7 @@ class VideoSummaryPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.after_process",
         name="video_summary_after_process",
-        description="检测视频并异步概括，将摘要注入 processed_plain_text",
+        description="检测视频并异步概括，概括结果通过聊天历史注入给出",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         error_policy=ErrorPolicy.SKIP,
@@ -403,62 +432,79 @@ class VideoSummaryPlugin(MaiBotPlugin):
             stream_id or "-",
             [a.name or a.file_id or a.url for a in assets],
         )
-        # 先写入“处理中”占位，避免主链完全看不到视频
+        # 写入事实性占位：只声明“已检测到视频、概括将另行给出”，不写“正在生成”。
+        # 概括结果改由聊天历史注入送达，本条文本不会再被回写，因此措辞必须始终成立。
         plain = str(message.get("processed_plain_text") or "").strip()
-        pending_line = f"{_PENDING_MARKER} 检测到 {len(assets)} 个视频，正在生成内容概括"
+        pending_line = f"{_PENDING_MARKER} 检测到 {len(assets)} 个视频，概括结果将作为一条上下文消息另行给出"
+        modified = False
         if _PENDING_MARKER not in plain and _SUMMARY_MARKER not in plain:
             message["processed_plain_text"] = f"{plain}\n{pending_line}".strip() if plain else pending_line
+            modified = True
 
         for asset in assets:
-            self._spawn_background(self._process_and_store(asset, stream_id=stream_id, message=message))
+            self._spawn_background(self._process_and_store(asset, stream_id=stream_id))
 
+        # 宿主会用 deserialize_session_message() 造一个**新的** SessionMessage，
+        # 所以这里只做同步改写；未改写就返回 None，省掉宿主一次无谓的反序列化。
+        if not modified:
+            return None
         return {"action": "continue", "modified_kwargs": {"message": message}}
 
     @HookHandler(
         "maisaka.replyer.before_model_request",
         name="video_summary_before_model_request",
-        description="在模型请求前注入最近视频概括",
+        description="在模型请求前把最近视频概括注入为一条 System Item（可选，会降低 prompt 缓存命中率）",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def on_before_model_request(self, messages: Any = None, **kwargs: Any) -> dict[str, Any] | None:
-        """模型前注入 session 最近概括。"""
+    async def on_before_model_request(
+        self,
+        items: Any = None,
+        item_schema_version: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """按 ContextItem 快照协议注入最近概括。
+
+        宿主实际传入 ``items``（ContextItem 快照列表）+ ``item_schema_version``，
+        并只读回 ``modified_kwargs["items"]`` / ``modified_kwargs["item_schema_version"]``
+        （见 ``src/chat/replyer/maisaka_generator_base.py:764-796``）。
+        键名写成 ``messages`` 会入参恒为 None、返回键被忽略，且不报任何错。
+        """
 
         if not self.config.plugin.enabled or not self.config.summary.inject_on_model_request:
             return None
-        if not isinstance(messages, list):
+        if not isinstance(items, list):
             return None
 
-        session_id = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        session_id = str(kwargs.get("session_id") or "").strip()
         record = self._get_session_latest(session_id) if session_id else None
         if record is None and self._session_latest:
             # 无 session 时退回全局最近一条（仍有效）
             record = max(self._session_latest.values(), key=lambda item: float(item.get("ts") or 0.0))
-        if not record:
+        if not record or not str(record.get("summary") or "").strip():
             return None
-
-        summary = str(record.get("summary") or "").strip()
-        if not summary:
-            return None
-        if any(
-            isinstance(msg, dict)
-            and isinstance(msg.get("content"), str)
-            and _SUMMARY_MARKER in msg.get("content", "")
-            for msg in messages
-        ):
+        if self._items_contain_summary(items):
             return None
 
         block = self._format_summary_block(record)
-        new_messages = list(messages)
+        new_items = list(items)
+        # 插在开头连续的 SystemMessageItem 之后、历史之前。
+        # 注意：这会改动 prompt 前缀，插入点之后的 token 缓存全部失效。
         insert_pos = 0
-        for index, msg in enumerate(messages):
-            if isinstance(msg, dict) and msg.get("role") == "system":
+        for index, item in enumerate(items):
+            if isinstance(item, dict) and item.get("item_type") == "SystemMessageItem":
                 insert_pos = index + 1
             else:
                 break
-        new_messages.insert(insert_pos, {"role": "system", "content": block})
-        return {"action": "continue", "modified_kwargs": {"messages": new_messages}}
+        new_items.insert(insert_pos, self._build_summary_item(record, block))
+        return {
+            "action": "continue",
+            "modified_kwargs": {
+                "items": new_items,
+                "item_schema_version": item_schema_version,
+            },
+        }
 
     @Command(
         "video_summary",
@@ -466,41 +512,49 @@ class VideoSummaryPlugin(MaiBotPlugin):
         pattern=r"^/(?:video_summary|视频概括|视频总结)(?:\s+.*)?$",
         aliases=["视频概括", "视频总结"],
     )
-    async def cmd_video_summary(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """命令：查询缓存或提示如何使用。"""
+    async def cmd_video_summary(self, **kwargs: Any) -> tuple[bool, str, int]:
+        """命令：查询缓存或提示如何使用。
+
+        返回值第三位在 MaiBot 1.2.4 里是 ``intercept_message_level``
+        （``src/plugin_runtime/component_query.py:554``、``src/chat/message_receive/bot.py:325``）：
+        0 = 让主链继续处理这条消息，非 0 = 吞掉这条消息。
+        本命令只负责触发概括（概括经聊天历史注入送达），所以一律返回 0，不抢走用户消息。
+        """
 
         if not self.config.plugin.enabled or not self.config.summary.enable_command:
-            return False, "", True
+            return False, "", 0
 
-        stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
-        text = str(kwargs.get("message") or kwargs.get("text") or "").strip()
+        # 宿主把命令原文放在 text（component_query.py:519）。
+        # 注意：message 键是序列化后的 SessionMessage **字典**，当文本用会让正则永远匹配不上。
+        text = str(kwargs.get("text") or "").strip()
+        stream_id = str(kwargs.get("stream_id") or "").strip()
         match = _CMD_PATTERN.match(text) if text else None
-        rest = (match.group("rest") if match else "") or ""
-        rest = rest.strip()
+        rest = ((match.group("rest") if match else "") or "").strip()
 
-        # 命令本身不直接对用户长篇回复；返回短状态，主链仍可继续
+        # 命令本身不直接回复用户；主链继续，概括通过聊天历史注入给模型看。
         record = self._get_session_latest(stream_id) if stream_id else None
         if record and str(record.get("summary") or "").strip():
-            # 返回空文本 + continue，避免抢答；bot 会从注入上下文知道
             self.ctx.logger.info("命令触发：会话已有视频概括，已确保可被模型看到")
-            return True, "", True
+            return True, "", 0
 
         if rest:
             # 允许用户贴 URL：/video_summary https://...
+            if not rest.lower().startswith(("http://", "https://")):
+                self.ctx.logger.warning("命令参数不是 http(s) 视频直链，已忽略：%s", rest[:120])
+                return True, "", 0
             asset = media_mod.VideoAsset(source_kind="command", url=rest, name=Path(rest).name or "video")
-            self._spawn_background(self._process_and_store(asset, stream_id=stream_id, message=None))
-            return True, "", True
+            self._spawn_background(self._process_and_store(asset, stream_id=stream_id))
+            return True, "", 0
 
-        self.ctx.logger.info("命令触发：当前会话尚缓存概括；请先发送视频或附带 URL")
-        return True, "", True
+        self.ctx.logger.info("命令触发：当前会话尚无视频概括；请先发送视频或附带 URL")
+        return True, "", 0
 
     @Tool(
         "video_summary_lookup",
-        brief_description="查询当前会话最近一次视频内容概括",
-        detailed_description=(
-            "当用户刚发送视频、或对话涉及视频内容时调用。"
-            "参数：\n"
-            "- stream_id：string，可选，当前聊天流 ID；缺省时用最近全局结果。"
+        description=(
+            "查询当前会话最近一次视频内容概括。"
+            "当用户刚发送视频、或对话涉及视频内容时调用；"
+            "不传 stream_id 时回退到最近一次全局结果。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -512,30 +566,41 @@ class VideoSummaryPlugin(MaiBotPlugin):
         ],
     )
     async def tool_video_summary_lookup(self, stream_id: str = "", **kwargs: Any) -> dict[str, Any]:
-        """供模型查询最近视频概括。"""
+        """供模型查询最近视频概括。
+
+        失败必须显式 ``"success": False``：宿主判定是
+        ``bool(result.get("success", True))``（``src/plugin_runtime/component_query.py:859``），
+        缺字段会被当成成功，错误正文就会被 Planner 当正常工具输出、不再重试。
+        """
 
         del kwargs
         if not self.config.plugin.enabled or not self.config.summary.enable_tool:
-            return {"content": "视频概括插件未启用"}
+            return {
+                "success": False,
+                "content": "视频概括插件未启用",
+                "error": "插件或 Tool 未启用",
+            }
 
         sid = str(stream_id or "").strip()
         record = self._get_session_latest(sid) if sid else None
         if record is None and self._session_latest:
             record = max(self._session_latest.values(), key=lambda item: float(item.get("ts") or 0.0))
         if not record:
-            return {"content": "暂无视频概括结果。请等待自动处理完成，或让用户重新发送视频。"}
-        return {"content": self._format_summary_block(record)}
+            return {
+                "success": False,
+                "content": "暂无视频概括结果。请等待自动处理完成，或让用户重新发送视频。",
+                "error": "当前没有可用的视频概括结果",
+            }
+        # 记录存在但该次概括失败时仍算「查询成功」：正文里已写明失败原因，
+        # 标成失败只会让 Planner 反复重试同一个缓存结果，反而更糟。
+        return {"success": True, "content": self._format_summary_block(record)}
 
     @Tool(
         "video_summary_ingest",
-        brief_description="对指定视频 URL 立即生成内容概括",
-        detailed_description=(
-            "当需要手动对某个视频（公网 http(s) 视频直链）生成概括时调用，"
-            "例如用户在对话中贴出视频链接、或需要重试某个视频。"
-            "参数：\n"
-            "- url：string，必填，视频直链（http/https）。\n"
-            "- stream_id：string，可选，当前聊天流 ID（用于缓存归属）。\n"
-            "返回生成的概括文本；失败时返回错误原因。"
+        description=(
+            "对指定的公网 http(s) 视频直链立即生成内容概括并返回文本。"
+            "适用于用户在对话中贴出视频链接、或需要重试某个视频的场景；"
+            "stream_id 用于把结果归属到会话。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -557,11 +622,19 @@ class VideoSummaryPlugin(MaiBotPlugin):
 
         del kwargs
         if not self.config.plugin.enabled:
-            return {"content": "视频概括插件未启用"}
+            return {
+                "success": False,
+                "content": "视频概括插件未启用",
+                "error": "插件未启用",
+            }
 
         raw_url = str(url or "").strip()
         if not raw_url.lower().startswith(("http://", "https://")):
-            return {"content": "参数 url 需要是 http(s) 视频直链"}
+            return {
+                "success": False,
+                "content": "参数 url 需要是 http(s) 视频直链",
+                "error": f"非法 url：{raw_url or '<空>'}",
+            }
 
         asset = media_mod.VideoAsset(
             source_kind="tool",
@@ -569,14 +642,18 @@ class VideoSummaryPlugin(MaiBotPlugin):
             name=Path(raw_url).name or "video",
         )
         # 直接等待结果（走与自动流程相同的缓存/inflight/概括逻辑）
+        # publish=False：本次结果马上作为工具返回值进入本轮上下文，再追加进聊天历史只会重复一遍。
         try:
-            record = await self._process_and_store(asset, stream_id=stream_id or "", message=None)
+            record = await self._process_and_store(asset, stream_id=stream_id or "", publish=False)
         except Exception as exc:  # noqa: BLE001
-            return {"content": f"视频概括失败：{exc}"}
+            # 宿主对「工具抛异常」只会包成 {"content": ...}（component_query.py:603），
+            # 那种结果没有 success 键、会被判成成功，所以这里必须自己转成显式失败。
+            return {"success": False, "content": f"视频概括失败：{exc}", "error": str(exc)}
 
         if not record.get("success"):
-            return {"content": f"视频概括失败：{record.get('error') or '未知错误'}"}
-        return {"content": self._format_summary_block(record)}
+            error = str(record.get("error") or "未知错误")
+            return {"success": False, "content": f"视频概括失败：{error}", "error": error}
+        return {"success": True, "content": self._format_summary_block(record)}
 
     # ------------------------------------------------------------------
     # Core processing
@@ -602,14 +679,22 @@ class VideoSummaryPlugin(MaiBotPlugin):
         asset: media_mod.VideoAsset,
         *,
         stream_id: str,
-        message: dict[str, Any] | None,
+        publish: bool = True,
     ) -> dict[str, Any]:
-        """处理单个视频并写入缓存。"""
+        """处理单个视频、写入缓存，并把结果发布到已启用的注入通道。
+
+        Args:
+            asset: 待处理的视频素材。
+            stream_id: 目标聊天流 ID，用作会话归属与注入目标。
+            publish: 是否把结果发布到聊天历史；工具同步返回结果时传 False 以免重复注入。
+        """
 
         cache_key = asset.cache_key
         cached = self._get_cache(cache_key)
         if cached is not None:
             self._remember_session(stream_id, cached)
+            if publish:
+                await self._publish_summary(stream_id, cached)
             return cached
 
         async with self._lock:
@@ -629,10 +714,47 @@ class VideoSummaryPlugin(MaiBotPlugin):
 
         self._set_cache(cache_key, result)
         self._remember_session(stream_id, result)
-        if message is not None:
-            # 尽力把结果合并回当前消息文本（若主链仍持有同一对象则立即可见）
-            self._merge_summary_into_message(message, result)
+        if publish:
+            await self._publish_summary(stream_id, result)
         return result
+
+    async def _publish_summary(self, stream_id: str, record: dict[str, Any]) -> None:
+        """把概括追加进 Maisaka 聊天历史（主注入通道）。
+
+        走 ``ctx.maisaka.context.append``：宿主把它 append 到 ``runtime._chat_history``
+        （见 ``src/plugin_runtime/capabilities/core.py:191-207``），成为一条真实上下文消息，
+        后续回合都能看到；因为是 append-only，已有 prompt 前缀不变，不影响缓存命中。
+        """
+
+        if not self.config.summary.inject_chat_history:
+            return
+
+        sid = str(stream_id or "").strip()
+        if not sid:
+            self.ctx.logger.warning(
+                "视频概括已完成但缺少 stream_id，无法追加到聊天历史 name=%s",
+                record.get("asset_name") or record.get("asset_url") or record.get("cache_key"),
+            )
+            return
+
+        publish_key = f"{sid}|{record.get('cache_key') or ''}"
+        if publish_key in self._published:
+            return
+
+        block = self._format_summary_block(record)
+        try:
+            await self.ctx.maisaka.context.append(
+                sid,
+                [{"type": "text", "data": block}],
+                visible_text=block,
+                source_kind=f"plugin:{self.ctx.plugin_id}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error("追加视频概括到聊天历史失败 session=%s: %s", sid, exc, exc_info=True)
+            return
+
+        self._published.add(publish_key)
+        self.ctx.logger.info("视频概括已追加到聊天历史 session=%s name=%s", sid, record.get("asset_name") or "-")
 
     async def _run_summarize(self, asset: media_mod.VideoAsset) -> dict[str, Any]:
         """实际执行概括。"""
@@ -1003,14 +1125,39 @@ class VideoSummaryPlugin(MaiBotPlugin):
         err = str(record.get("error") or "未知错误").strip()
         return f"{_FAIL_MARKER} {err}"
 
-    def _merge_summary_into_message(self, message: dict[str, Any], record: dict[str, Any]) -> None:
-        plain = str(message.get("processed_plain_text") or "")
-        block = self._format_summary_block(record)
-        # 替换处理中占位
-        lines = [line for line in plain.splitlines() if _PENDING_MARKER not in line]
-        if block not in "\n".join(lines):
-            lines.append(block)
-        message["processed_plain_text"] = "\n".join(line for line in lines if line.strip()).strip()
+    @staticmethod
+    def _items_contain_summary(items: list[Any]) -> bool:
+        """判断 items 里是否已有本插件的概括块，避免重复注入。"""
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for part in item.get("parts") or []:
+                if isinstance(part, dict) and _SUMMARY_MARKER in str(part.get("text") or ""):
+                    return True
+        return False
+
+    @staticmethod
+    def _build_summary_item(record: dict[str, Any], block: str) -> dict[str, Any]:
+        """构造模型前注入用的 ContextItem 快照。
+
+        结构对齐 ``serialize_context_item_snapshot``（``src/llm_models/request_snapshot.py:273``）：
+        ``item_id`` 非空、``logical_turn_id`` 可为 null 但键必须存在、``timestamp`` 为合法 ISO 时间。
+        """
+
+        digest = hashlib.sha256(
+            f"{record.get('cache_key') or ''}|{block}".encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        timestamp = datetime.fromtimestamp(float(record.get("ts") or time.time())).isoformat()
+        return {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": f"video_summary_{digest}",
+                "logical_turn_id": None,
+                "timestamp": timestamp,
+            },
+            "parts": [{"type": "text", "text": block}],
+        }
 
     @staticmethod
     def _extract_stream_id(message: dict[str, Any]) -> str:

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
+import os
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+# 宿主源码根目录：默认用工作区里的 MaiBot；可用 MAIBOT_ROOT 指向另一份 checkout
+# （例如同时验证 MaiBot 1.3.1），自检会直接装载该目录里的真实代码来校验注入协议。
+HOST_ROOT = Path(os.environ.get("MAIBOT_ROOT") or (ROOT.parent / "MaiBot")).expanduser().resolve()
 
 import http_client as http_mod  # noqa: E402
 import media as media_mod  # noqa: E402
@@ -195,6 +202,126 @@ def test_components_and_hooks() -> None:
     print("OK components")
 
 
+def _import_host(module_names: list[str], *, probe: Path) -> list[Any] | None:
+    """在临时工作目录中导入宿主模块。
+
+    宿主的日志初始化会把 ``logs/`` 写到当前工作目录，所以必须在临时目录里导入，
+    否则每次自检都会在插件仓库里留下 ``logs/app_*.log.jsonl``。
+
+    找不到宿主源码时返回 None；调用方必须打印跳过提示，不能静默放过。
+    可用 ``MAIBOT_ROOT`` 指向别的 checkout 来验证其它 MaiBot 版本。
+    """
+
+    mai_bot_root = HOST_ROOT
+    if not probe.is_file():
+        print(f"WARN 未找到宿主源码（{mai_bot_root}），本次不做真实代码校验")
+        return None
+    sys.path.insert(0, str(mai_bot_root))
+    original_cwd = Path.cwd()
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            os.chdir(scratch)
+            try:
+                # 必须先导入 hook_payloads：直接导入 request_snapshot 会撞上宿主的循环导入。
+                return [importlib.import_module(name) for name in module_names]
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARN 找到宿主源码但导入失败，跳过该校验: {exc}")
+                return None
+            finally:
+                os.chdir(original_cwd)
+    finally:
+        sys.path.remove(str(mai_bot_root))
+
+
+def _host_item_validator():  # noqa: ANN202
+    """装载宿主真实的 items 反序列化链路，用于校验 ContextItem 快照协议。"""
+
+    modules = _import_host(
+        [
+            "src.plugin_runtime.hook_payloads",
+            "src.llm_models.payload_content.context_protocol",
+            "src.llm_models.request_snapshot",
+        ],
+        probe=HOST_ROOT / "src" / "plugin_runtime" / "hook_payloads.py",
+    )
+    if modules is None:
+        return None
+    hook_payloads, context_protocol, request_snapshot = modules
+
+    def _validate(raw_items: list[dict[str, Any]], item_schema_version: Any):  # noqa: ANN202
+        items = hook_payloads.deserialize_prompt_items(
+            raw_items,
+            item_schema_version=item_schema_version,
+            mode=context_protocol.ContextProtocolMode.REQUEST_CONTEXT,
+            original_items=(),
+        )
+        return [request_snapshot.serialize_context_item_snapshot(item) for item in items]
+
+    return _validate
+
+
+def _host_segment_reader():  # noqa: ANN202
+    """装载宿主的消息段规范化与还原链路，校验聊天历史注入的段结构。"""
+
+    modules = _import_host(
+        [
+            "src.plugin_runtime.hook_payloads",
+            "src.plugin_runtime.capabilities.core",
+            "src.plugin_runtime.host.message_utils",
+        ],
+        probe=HOST_ROOT / "src" / "plugin_runtime" / "capabilities" / "core.py",
+    )
+    if modules is None:
+        return None
+    _, capabilities_core, message_utils = modules
+
+    def _read(raw_segments: list[dict[str, Any]]) -> list[str]:
+        segments = capabilities_core._normalize_context_segments(raw_segments)
+        sequence = message_utils.PluginMessageUtils._message_sequence_from_dict(segments)
+        return [component.text for component in sequence.components if hasattr(component, "text")]
+
+    return _read
+
+
+def _host_tool_result_parser():  # noqa: ANN202
+    """装载宿主把插件工具返回值转成执行结果的那一步，用于校验 success 语义。"""
+
+    modules = _import_host(
+        ["src.plugin_runtime.hook_payloads", "src.plugin_runtime.component_query"],
+        probe=HOST_ROOT / "src" / "plugin_runtime" / "component_query.py",
+    )
+    if modules is None:
+        return None
+    component_query = modules[1]
+
+    class _StubEntry:
+        name = "video_summary_smoke"
+        plugin_id = "github.xiexiaojia780.video-summary-plugin"
+
+    def _parse(payload: dict[str, Any]):  # noqa: ANN202
+        return component_query.ComponentQueryService._parse_tool_invoke_result(_StubEntry(), payload)
+
+    return _parse
+
+
+def _summary_items() -> list[dict[str, Any]]:
+    """构造一组符合宿主协议的 ContextItem 快照，模拟模型请求前的 items。"""
+
+    stamp = "2026-01-01T00:00:00"
+    return [
+        {
+            "item_type": "SystemMessageItem",
+            "meta": {"item_id": "sys-1", "logical_turn_id": None, "timestamp": stamp},
+            "parts": [{"type": "text", "text": "base prompt"}],
+        },
+        {
+            "item_type": "UserMessageItem",
+            "meta": {"item_id": "user-1", "logical_turn_id": None, "timestamp": stamp},
+            "parts": [{"type": "text", "text": "看看这个视频"}],
+        },
+    ]
+
+
 def test_injection_flow() -> None:
     plugin = plugin_mod.create_plugin()
     paths = PluginPaths(
@@ -202,7 +329,14 @@ def test_injection_flow() -> None:
         runtime_dir=Path("temp/plugins/video_summary_smoke"),
     )
 
-    async def rpc(*_a, **_k):  # noqa: ANN001
+    # 捕获 ctx.maisaka.context.append 的真实调用载荷
+    appended: list[dict[str, Any]] = []
+
+    async def rpc(method, plugin_id, payload, **_kwargs):  # noqa: ANN001
+        del plugin_id
+        if method == "cap.call" and str((payload or {}).get("capability")) == "maisaka.context.append":
+            appended.append(dict((payload or {}).get("args") or {}))
+            return {"success": True, "index": 0}
         return {}
 
     ctx = PluginContext(
@@ -213,26 +347,23 @@ def test_injection_flow() -> None:
     plugin._set_context(ctx)
     plugin.set_plugin_config(plugin.get_default_config())
 
-    async def fake_process_and_store(asset, stream_id="", message=None):  # noqa: ANN001
-        record = {
-            "success": True,
-            "summary": "一只猫在玩球",
-            "asset_name": asset.name,
-            "ts": time.time(),
-            "error": "",
-            "mode": "frame_vlm",
-        }
-        plugin._remember_session(stream_id, record)
-        if message is not None:
-            plugin._merge_summary_into_message(message, record)
-        return record
+    # 只替换最内层概括实现，从而真实走通 _process_and_store → _publish_summary 路径
+    summarized: list[str] = []
 
-    plugin._process_and_store = fake_process_and_store  # type: ignore[method-assign]
+    async def fake_summarize(asset):  # noqa: ANN001
+        summarized.append(asset.name)
+        return "一只猫在玩球"
+
+    plugin._summarize_asset = fake_summarize  # type: ignore[method-assign]
+
+    validator = _host_item_validator()
+    segment_reader = _host_segment_reader()
+    tool_result_parser = _host_tool_result_parser()
 
     async def _run() -> None:
         msg = {
             "processed_plain_text": "看看这个",
-            "stream_id": "s1",
+            "session_id": "s1",
             "raw_message": [
                 {
                     "type": "file",
@@ -247,39 +378,154 @@ def test_injection_flow() -> None:
         assert result is not None and result["action"] == "continue"
         plain = result["modified_kwargs"]["message"]["processed_plain_text"]
         assert plugin_mod._PENDING_MARKER in plain
-        await asyncio.sleep(0.05)
-        assert plugin_mod._SUMMARY_MARKER in msg["processed_plain_text"]
-        assert "一只猫在玩球" in msg["processed_plain_text"]
+        # 占位文案不得承诺“正在生成”，否则概括完成/失败后它会永久失真
+        assert "正在生成" not in plain
 
-        hook = await plugin.on_before_model_request(
-            messages=[
-                {"role": "system", "content": "base"},
-                {"role": "user", "content": "hi"},
-            ],
-            session_id="s1",
+        await asyncio.sleep(0.1)
+
+        # ---- C 通道：概括必须作为一条上下文消息追加进聊天历史 ----
+        assert len(appended) == 1, appended
+        call = appended[0]
+        assert call["stream_id"] == "s1", call
+        assert call["segments"] == [
+            {"type": "text", "data": f"{plugin_mod._SUMMARY_MARKER} 文件=a.mp4\n一只猫在玩球"}
+        ], call
+        assert "一只猫在玩球" in call["visible_text"]
+        assert str(call["source_kind"]).startswith("plugin:")
+
+        # 用宿主真实链路还原段结构，确认模型最终读到的是概括正文
+        if segment_reader is None:
+            print(f"WARN 宿主源码不可用（{HOST_ROOT}），跳过聊天历史段结构校验")
+        else:
+            recovered = segment_reader(call["segments"])
+            assert recovered == [f"{plugin_mod._SUMMARY_MARKER} 文件=a.mp4\n一只猫在玩球"], recovered
+
+        # 关闭聊天历史注入后不得再追加
+        plugin.config.summary.inject_chat_history = False
+        before = len(appended)
+        await plugin._publish_summary("s3", plugin._get_session_latest("s1"))
+        assert len(appended) == before
+        plugin.config.summary.inject_chat_history = True
+
+        # 同一 (session, cache_key) 不得重复入库
+        await plugin._publish_summary("s1", plugin._get_session_latest("s1"))
+        assert len(appended) == 1, appended
+
+        # ---- B 通道：默认关闭时完全不注入 ----
+        items = _summary_items()
+        assert (
+            await plugin.on_before_model_request(items=items, item_schema_version=1, session_id="s1") is None
         )
+
+        plugin.config.summary.inject_on_model_request = True
+        hook = await plugin.on_before_model_request(items=items, item_schema_version=1, session_id="s1")
         assert hook is not None
-        injected = hook["modified_kwargs"]["messages"]
-        assert any(plugin_mod._SUMMARY_MARKER in str(m.get("content")) for m in injected)
-        assert await plugin.on_before_model_request(messages=injected, session_id="s1") is None
+        modified = hook["modified_kwargs"]
+        # 键名必须是宿主读回的 items / item_schema_version；写成 messages 会静默失效
+        assert set(modified) == {"items", "item_schema_version"}, modified
+        assert modified["item_schema_version"] == 1
+        new_items = modified["items"]
+        assert len(new_items) == 3
+        assert new_items[0]["parts"][0]["text"] == "base prompt"
+        assert plugin_mod._SUMMARY_MARKER in new_items[1]["parts"][0]["text"]
+        assert new_items[2]["parts"][0]["text"] == "看看这个视频"
 
+        # ---- 用宿主真实反序列化器做往返校验 ----
+        if validator is None:
+            print(f"WARN 宿主源码不可用（{HOST_ROOT}），跳过 items 快照协议往返校验")
+        else:
+            round_trip = validator(new_items, 1)
+            assert len(round_trip) == 3, round_trip
+            assert any(plugin_mod._SUMMARY_MARKER in str(item) for item in round_trip), round_trip
+            # schema 版本不匹配时宿主会抛 ValueError 并忽略整个改动
+            try:
+                validator(new_items, 99)
+                raise AssertionError("schema 版本不匹配应当抛 ValueError")
+            except ValueError:
+                pass
+
+        # 已含概括则不再重复注入
+        assert (
+            await plugin.on_before_model_request(items=new_items, item_schema_version=1, session_id="s1")
+            is None
+        )
+
+        # 工具路径：结果直接返回给模型，不应再追加一遍聊天历史
+        before = len(appended)
         tool = await plugin.tool_video_summary_lookup(stream_id="s1")
+        assert tool["success"] is True, tool
         assert "一只猫在玩球" in tool["content"]
+        assert len(appended) == before
 
-        cmd = await plugin.cmd_video_summary(stream_id="s1", message="/video_summary")
-        assert cmd == (True, "", True)
+        # ---- Tool 失败必须显式 success=False，否则宿主会记成成功 ----
+        saved_sessions = dict(plugin._session_latest)
+        plugin._session_latest.clear()
+        miss = await plugin.tool_video_summary_lookup(stream_id="s1")
+        assert miss["success"] is False, miss
+        plugin._session_latest.update(saved_sessions)
+
+        bad_url = await plugin.tool_video_summary_ingest(url="not-a-url")
+        assert bad_url["success"] is False, bad_url
+
+        if tool_result_parser is None:
+            print(f"WARN 宿主源码不可用（{HOST_ROOT}），跳过 Tool success 语义校验")
+        else:
+            # 正向：显式失败必须被宿主判定为失败，且正文仍保留
+            for payload in (miss, bad_url):
+                parsed = tool_result_parser(payload)
+                assert parsed.success is False, (payload, parsed.success)
+                assert parsed.error_message, (payload, parsed.error_message)
+                assert parsed.content, (payload, parsed.content)
+            assert tool_result_parser(tool).success is True
+            # 反向对照：这正是修掉的那个 bug —— 缺 success 字段会被宿主当成功
+            assert tool_result_parser({"content": "插件未启用"}).success is True
+
+        # ---- 命令契约 ----
+        # 第三位是 intercept_message_level（host: component_query.py:554 / bot.py:325）：
+        # 必须是 0，否则这条消息会被主链吞掉、根本不进 Maisaka。
+        assert await plugin.cmd_video_summary(text="/video_summary", stream_id="s1") == (True, "", 0)
+
+        # 历史 bug：message 键是序列化字典，被当成命令文本用会让正则永远匹配不上
+        assert await plugin.cmd_video_summary(
+            text="/video_summary",
+            message={"processed_plain_text": "/video_summary", "session_id": "s1"},
+            stream_id="s1",
+        ) == (True, "", 0)
+
+        # 附 URL 时应真正触发处理
+        appended_before = len(appended)
+        assert await plugin.cmd_video_summary(
+            text="/video_summary https://example.com/x.mp4",
+            stream_id="s3",
+        ) == (True, "", 0)
+        await asyncio.sleep(0.1)
+        assert "x.mp4" in summarized, summarized
+        assert len(appended) == appended_before + 1, appended
+
+        # 非 URL 参数必须被忽略，不得拿去 NapCat 瞎抓
+        summarized_before = list(summarized)
+        assert await plugin.cmd_video_summary(text="/video_summary 你好", stream_id="s3") == (True, "", 0)
+        await asyncio.sleep(0.05)
+        assert summarized == summarized_before, summarized
+
+        # 命令关闭时返回 0，同样不能拦截主链
+        plugin.config.summary.enable_command = False
+        assert await plugin.cmd_video_summary(text="/video_summary", stream_id="s1") == (False, "", 0)
+        plugin.config.summary.enable_command = True
 
         # 默认配置
         default = plugin.get_default_config()
         assert default["summary"]["mode"] == "frame_vlm"
         assert default["summary"]["auto_process"] is True
+        assert default["summary"]["inject_chat_history"] is True
+        assert default["summary"]["inject_on_model_request"] is False
 
         plugin.config.summary.auto_process = False
         assert (
             await plugin.on_after_process(
                 message={
                     "processed_plain_text": "x",
-                    "stream_id": "s2",
+                    "session_id": "s2",
                     "raw_message": [
                         {
                             "type": "file",
@@ -295,7 +541,7 @@ def test_injection_flow() -> None:
         )
 
     asyncio.run(_run())
-    print("OK injection flow")
+    print("OK injection flow (C=聊天历史 / B=items 快照)")
 
 
 def test_format_and_cache() -> None:
