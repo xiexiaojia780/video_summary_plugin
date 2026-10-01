@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "视频内容概括插件",
   "description": "检测入站视频/视频文件，抽帧走 Host VLM 或直调外部视频多模态 API 生成内容概括，并把概括作为上下文消息追加进聊天历史（不直接对用户发言）",
   "author": {

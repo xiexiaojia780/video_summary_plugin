@@ -3,7 +3,7 @@
 > 当 bot 收到视频 / 视频文件时，自动（或命令触发）生成内容概括，并**只注入 bot 上下文**，不直接对用户发言。
 
 - **插件 ID**：`github.xiexiaojia780.video-summary-plugin`
-- **版本**：1.1.0
+- **版本**：1.1.1
 - **作者**：[xiexiaojia780](https://github.com/xiexiaojia780)
 - **License**：`GPL-3.0-or-later`（与 `_manifest.json` / 根目录 `LICENSE` 一致；正文为 GNU GPLv3，允许 any later version）
 - **SDK**：`maibot-plugin-sdk` ≥ 2.0（导入名 `maibot_sdk`）
